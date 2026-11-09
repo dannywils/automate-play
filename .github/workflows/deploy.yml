@@ -1,0 +1,66 @@
+name: Deploy browser game
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing browser release tag to deploy
+        required: true
+        type: string
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download and verify the compiled game
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, zipfile
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,100}', tag):
+              raise SystemExit('Invalid release tag')
+          repo = os.environ['REPO']
+          release = json.loads(subprocess.check_output(['gh', 'release', 'view', tag, '--repo', repo, '--json', 'body']))
+          match = re.search(r'Archive SHA256: `([a-f0-9]{64})`', release['body'])
+          if not match: raise SystemExit('Release has no archive checksum')
+          subprocess.run(['gh', 'release', 'download', tag, '--repo', repo, '--pattern', 'merit-web.zip'], check=True)
+          with open('merit-web.zip', 'rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          if digest != match[1]: raise SystemExit('Archive checksum mismatch')
+          out = pathlib.Path('site'); out.mkdir()
+          with zipfile.ZipFile('merit-web.zip') as archive:
+              for member in archive.infolist():
+                  if member.is_dir() or '/' in member.filename or '\\' in member.filename or member.filename in ('.', '..'):
+                      raise SystemExit('Unexpected archive path')
+                  (out / member.filename).write_bytes(archive.read(member))
+          manifest = json.loads((out / 'site-manifest.json').read_text())
+          for name, record in manifest['files'].items():
+              if pathlib.Path(name).name != name: raise SystemExit('Invalid manifest path')
+              with (out / name).open('rb') as stream:
+                  actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+              if actual != record['sha256']: raise SystemExit(f'File checksum mismatch: {name}')
+          if not all((out / name).is_file() for name in ['index.html', 'index.js', 'index.wasm', 'index.pck']):
+              raise SystemExit('Incomplete game export')
+          PY
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
